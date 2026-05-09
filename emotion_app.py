@@ -287,12 +287,12 @@ with st.sidebar:
     st.divider()
 
     st.subheader("📁 Model Paths")
-    mlp_path      = st.text_input("MLP model (.pkl)",          "MLP_pt/ser_mlp_model.pkl")
-    scaler_path   = st.text_input("Scaler (.pkl)",             "MLP_pt/ser_scaler.pkl")
-    le_mlp_path   = st.text_input("MLP label encoder (.pkl)",  "MLP_pt/ser_label_encoder.pkl")
-    w2v_weights   = st.text_input("wav2vec weights (.pt)",     "FT_pt/best_wav2vec2_ser.pt")
-    w2v_config    = st.text_input("wav2vec config (.json)",    "FT_pt/wav2vec2_config.json")
-    le_w2v_path   = st.text_input("wav2vec label encoder",     "FT_pt/wav2vec2_label_encoder.pkl")
+    mlp_path      = st.text_input("MLP model (.pkl)",          "ser_mlp_model.pkl")
+    scaler_path   = st.text_input("Scaler (.pkl)",             "ser_scaler.pkl")
+    le_mlp_path   = st.text_input("MLP label encoder (.pkl)",  "ser_label_encoder.pkl")
+    w2v_weights   = st.text_input("wav2vec weights (.pt)",     "best_wav2vec2_ser.pt")
+    w2v_config    = st.text_input("wav2vec config (.json)",    "wav2vec2_config.json")
+    le_w2v_path   = st.text_input("wav2vec label encoder",     "wav2vec2_label_encoder.pkl")
 
     st.divider()
     st.subheader("🤖 Active Models")
