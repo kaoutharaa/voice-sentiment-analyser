@@ -1,10 +1,11 @@
 """
 Speech Emotion Recognition - Streamlit App
 Supports: real-time streaming | hold-to-record | file upload
-Models: Classical MLP + fine-tuned wav2vec 2.0 (from notebook_3_inference_comparison)
+Models: Classical MLP + fine-tuned wav2vec 2.0
+Model weights loaded from HuggingFace Hub: Kaouthara/voice-emotion-detector
 """
 
-import os, io, json, warnings, tempfile, time, threading, queue
+import os, io, json, warnings, time
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -19,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import Wav2Vec2Processor, Wav2Vec2Model
 from pydub import AudioSegment
+from huggingface_hub import hf_hub_download
 
 # ──────────────────────────────────────────────
 # Page config
@@ -34,10 +36,8 @@ st.set_page_config(
 # ──────────────────────────────────────────────
 st.markdown("""
 <style>
-/* global */
 body { font-family: 'Segoe UI', sans-serif; }
 
-/* mic button */
 .mic-btn {
     width: 80px; height: 80px; border-radius: 50%;
     background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
@@ -59,7 +59,6 @@ body { font-family: 'Segoe UI', sans-serif; }
     50%      { transform: scale(1.12); }
 }
 
-/* emotion cards */
 .emotion-card {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     border-radius: 16px; padding: 20px;
@@ -68,14 +67,12 @@ body { font-family: 'Segoe UI', sans-serif; }
 .emotion-label { font-size: 2rem; font-weight: 700; margin: 0; }
 .emotion-conf  { font-size: 1rem; opacity: 0.85; }
 
-/* progress bars for probabilities */
 .prob-bar-container { margin: 4px 0; }
 .prob-bar-label { display: flex; justify-content: space-between; font-size: 0.85rem; }
 .prob-bar-bg    { background: #e0e0e0; border-radius: 6px; height: 12px; }
 .prob-bar-fill  { height: 12px; border-radius: 6px;
                   background: linear-gradient(90deg,#667eea,#764ba2); }
 
-/* tabs */
 .stTabs [data-baseweb="tab"] { font-size: 1rem; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
@@ -89,10 +86,26 @@ MAX_DURATION = 4.0
 PRE_EMPHASIS = 0.97
 TRIM_TOP_DB  = 30
 
+# Filenames as they exist in the HuggingFace repo
+HF_FILES = {
+    "mlp":        "ser_mlp_model.pkl",
+    "scaler":     "ser_scaler.pkl",
+    "le_mlp":     "ser_label_encoder.pkl",
+    "w2v_weights":"best_wav2vec2_ser.pt",
+    "w2v_config": "wav2vec2_config.json",
+    "le_w2v":     "wav2vec2_label_encoder.pkl",
+}
+
 EMOTION_EMOJI = {
     "angry":   "😡", "disgust": "🤢", "fear":    "😨",
     "happy":   "😄", "neutral": "😐", "ps":       "😲",
     "sad":     "😢", "surprise":"😲",
+}
+
+EMOTION_COLORS = {
+    "angry":"#FF4444","disgust":"#8B4513","fear":"#800080",
+    "happy":"#FFD700","neutral":"#607D8B","ps":"#FF6B35",
+    "sad":"#5B86E5","surprise":"#FF9800",
 }
 
 # ──────────────────────────────────────────────
@@ -110,13 +123,8 @@ def to_wav_bytes(uploaded_file) -> bytes:
 def load_and_clean(audio_bytes: bytes, target_sr: int) -> np.ndarray:
     buf = io.BytesIO(audio_bytes)
     y, sr = librosa.load(buf, sr=target_sr, mono=True)
-    
-    # FIX: Do not use the first 0.5s as noise profile, because in live 
-    # recordings the user is often already speaking. Instead, use 
-    # stationary noise reduction over the whole clip.
-    if len(y) > sr * 0.1: # safety check for very short clips
+    if len(y) > sr * 0.1:
         y = nr.reduce_noise(y=y, sr=sr, prop_decrease=0.5, stationary=True)
-
     y, _ = librosa.effects.trim(y, top_db=TRIM_TOP_DB)
     if len(y) == 0:
         buf.seek(0)
@@ -163,26 +171,43 @@ class Wav2Vec2ForEmotionClassification(nn.Module):
 
 
 # ──────────────────────────────────────────────
+# HuggingFace download helper
+# ──────────────────────────────────────────────
+def download_from_hub(repo_id: str, filename: str, cache_dir: str | None) -> str:
+    """Download a single file from a HF repo and return its local path."""
+    return hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        cache_dir=cache_dir or None,
+    )
+
+
+# ──────────────────────────────────────────────
 # Model loader (cached)
 # ──────────────────────────────────────────────
-@st.cache_resource(show_spinner="Loading models…")
-def load_models(mlp_path, scaler_path, le_mlp_path,
-                w2v_weights_path, w2v_config_path, le_w2v_path):
+@st.cache_resource(show_spinner="Downloading & loading models from HuggingFace…")
+def load_models(repo_id: str, cache_dir: str | None = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    mlp    = joblib.load(mlp_path)
-    scaler = joblib.load(scaler_path)
-    le_mlp = joblib.load(le_mlp_path)
+    # ── Download all artefacts ──────────────────
+    paths = {key: download_from_hub(repo_id, fname, cache_dir)
+             for key, fname in HF_FILES.items()}
 
-    with open(w2v_config_path) as f:
+    # ── Classical MLP stack ─────────────────────
+    mlp    = joblib.load(paths["mlp"])
+    scaler = joblib.load(paths["scaler"])
+    le_mlp = joblib.load(paths["le_mlp"])
+
+    # ── wav2vec 2.0 stack ───────────────────────
+    with open(paths["w2v_config"]) as f:
         w2v_cfg = json.load(f)
 
-    le_w2v    = joblib.load(le_w2v_path)
+    le_w2v    = joblib.load(paths["le_w2v"])
     processor = Wav2Vec2Processor.from_pretrained(w2v_cfg["model_name"])
     w2v_model = Wav2Vec2ForEmotionClassification(
         w2v_cfg["model_name"], w2v_cfg["num_classes"]
     ).to(device)
-    w2v_model.load_state_dict(torch.load(w2v_weights_path, map_location=device))
+    w2v_model.load_state_dict(torch.load(paths["w2v_weights"], map_location=device))
     w2v_model.eval()
 
     return mlp, scaler, le_mlp, w2v_model, processor, le_w2v, w2v_cfg, device
@@ -221,12 +246,6 @@ def predict_wav2vec(audio_bytes, w2v_model, processor, le_w2v, w2v_cfg, device):
 # ──────────────────────────────────────────────
 # UI helpers
 # ──────────────────────────────────────────────
-EMOTION_COLORS = {
-    "angry":"#FF4444","disgust":"#8B4513","fear":"#800080",
-    "happy":"#FFD700","neutral":"#607D8B","ps":"#FF6B35",
-    "sad":"#5B86E5","surprise":"#FF9800",
-}
-
 def render_emotion_card(label: str, probs: dict, model_name: str):
     emoji = EMOTION_EMOJI.get(label, "🎭")
     conf  = probs.get(label, 0)
@@ -238,7 +257,6 @@ def render_emotion_card(label: str, probs: dict, model_name: str):
         <div class="emotion-conf">Confidence: {conf:.1%}</div>
     </div>""", unsafe_allow_html=True)
 
-    # sorted probability bars
     sorted_probs = sorted(probs.items(), key=lambda x: -x[1])
     for emotion, p in sorted_probs:
         bar_w = int(p * 100)
@@ -262,7 +280,9 @@ def run_predictions(audio_bytes, models_loaded, models):
             results["MLP"] = predict_classical(audio_bytes, mlp, scaler, le_mlp)
     if "wav2vec" in models_loaded:
         with st.spinner("Running wav2vec 2.0…"):
-            results["wav2vec 2.0"] = predict_wav2vec(audio_bytes, w2v_model, processor, le_w2v, w2v_cfg, device)
+            results["wav2vec 2.0"] = predict_wav2vec(
+                audio_bytes, w2v_model, processor, le_w2v, w2v_cfg, device
+            )
     return results
 
 
@@ -278,7 +298,7 @@ def record_audio(duration: float, sr: int = SR_CLASSICAL) -> bytes:
 
 
 # ──────────────────────────────────────────────
-# Sidebar – model paths & selection
+# Sidebar – HuggingFace repo config & model selection
 # ──────────────────────────────────────────────
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/voice-recognition-scan.png", width=72)
@@ -286,13 +306,20 @@ with st.sidebar:
     st.markdown("**Speech Emotion Recognition**")
     st.divider()
 
-    st.subheader("📁 Model Paths")
-    mlp_path      = st.text_input("MLP model (.pkl)",          "ser_mlp_model.pkl")
-    scaler_path   = st.text_input("Scaler (.pkl)",             "ser_scaler.pkl")
-    le_mlp_path   = st.text_input("MLP label encoder (.pkl)",  "ser_label_encoder.pkl")
-    w2v_weights   = st.text_input("wav2vec weights (.pt)",     "best_wav2vec2_ser.pt")
-    w2v_config    = st.text_input("wav2vec config (.json)",    "wav2vec2_config.json")
-    le_w2v_path   = st.text_input("wav2vec label encoder",     "wav2vec2_label_encoder.pkl")
+    st.subheader("🤗 HuggingFace Repository")
+    repo_id = st.text_input(
+        "Repo ID",
+        value="Kaouthara/voice-emotion-detector",
+        help="HuggingFace repo that contains your model artefacts.",
+    )
+    cache_dir = st.text_input(
+        "Local cache directory (optional)",
+        value="",
+        help="Leave blank to use the default HF cache (~/.cache/huggingface).",
+    )
+
+    with st.expander("📄 Expected repo file structure", expanded=False):
+        st.code("\n".join(HF_FILES.values()), language="text")
 
     st.divider()
     st.subheader("🤖 Active Models")
@@ -306,17 +333,12 @@ with st.sidebar:
 # Load models
 # ──────────────────────────────────────────────
 models = None
-if load_btn or "models_loaded" not in st.session_state:
-    all_files = [mlp_path, scaler_path, le_mlp_path, w2v_weights, w2v_config, le_w2v_path]
-    missing   = [f for f in all_files if not os.path.exists(f)]
-    if missing:
-        st.sidebar.error(f"Missing files:\n" + "\n".join(f"• {f}" for f in missing))
-        st.sidebar.info("Place your model files in the same directory as this script, "
-                        "or update the paths above and click **Load / Reload Models**.")
+if load_btn or "models" not in st.session_state:
+    if not repo_id.strip():
+        st.sidebar.error("Please enter a HuggingFace repo ID.")
         st.stop()
     try:
-        models = load_models(mlp_path, scaler_path, le_mlp_path,
-                             w2v_weights, w2v_config, le_w2v_path)
+        models = load_models(repo_id.strip(), cache_dir.strip() or None)
         st.sidebar.success("✅ Models loaded!")
         st.session_state["models"] = models
     except Exception as e:
@@ -332,20 +354,22 @@ else:
 # Main UI – three tabs
 # ──────────────────────────────────────────────
 st.title("🎙️ Speech Emotion Recognition")
-st.markdown("Analyse the emotion in your voice using two models: a **Classical MLP** and a **fine-tuned wav2vec 2.0**.")
+st.markdown(
+    "Analyse the emotion in your voice using two models: "
+    "a **Classical MLP** and a **fine-tuned wav2vec 2.0**."
+)
 
 tab_record, tab_realtime, tab_upload = st.tabs([
     "🎤 Hold-to-Record", "⚡ Real-time Stream", "📂 Upload Audio"
 ])
 
 # ═══════════════════════════════════════════════
-# TAB 1 – Hold-to-Record  (WAV via st.audio_input)
+# TAB 1 – Hold-to-Record
 # ═══════════════════════════════════════════════
 with tab_record:
     st.markdown("### 🎤 Record Your Voice")
     st.markdown("Press the microphone button below, speak, then press **Analyse**.")
 
-    # st.audio_input is available in Streamlit ≥ 1.31
     audio_value = st.audio_input("Tap to record (hold and release)", key="recorder")
 
     if audio_value is not None:
@@ -362,7 +386,7 @@ with tab_record:
         st.info("👆 Click the mic icon above to start recording.")
 
 # ═══════════════════════════════════════════════
-# TAB 2 – Real-time streaming (sounddevice chunks)
+# TAB 2 – Real-time streaming
 # ═══════════════════════════════════════════════
 with tab_realtime:
     st.markdown("### ⚡ Real-time Emotion Detection")
@@ -389,7 +413,7 @@ with tab_realtime:
         step = chunk_sec * (1 - overlap / 100)
         st.info(f"🔴 Recording… window={chunk_sec}s, step={step:.1f}s. Press **Stop** to end.")
         iter_count = 0
-        while st.session_state["rt_running"] and iter_count < 60:   # safety cap
+        while st.session_state["rt_running"] and iter_count < 60:
             try:
                 audio_bytes = record_audio(chunk_sec, sr=SR_CLASSICAL)
             except Exception as e:
@@ -403,14 +427,14 @@ with tab_realtime:
                     with col:
                         render_emotion_card(label, probs, name)
 
-            time.sleep(max(0, step - chunk_sec))   # crude pacing
+            time.sleep(max(0, step - chunk_sec))
             iter_count += 1
     else:
         if not start_rt:
             st.info("Press **▶ Start Real-time** to begin continuous detection.")
 
 # ═══════════════════════════════════════════════
-# TAB 3 – Upload Audio (any format → WAV)
+# TAB 3 – Upload Audio
 # ═══════════════════════════════════════════════
 with tab_upload:
     st.markdown("### 📂 Upload an Audio File")
@@ -450,5 +474,5 @@ st.markdown(
     "<div style='text-align:center;opacity:0.5;font-size:0.8rem'>"
     "Speech Emotion Recognition · Classical MLP + wav2vec 2.0 · Built with Streamlit"
     "</div>",
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
