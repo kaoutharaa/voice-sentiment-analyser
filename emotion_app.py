@@ -331,11 +331,11 @@ st.markdown(
 # Upload Audio
 # ═══════════════════════════════════════════════
 st.markdown("### 📂 Upload an Audio File")
-st.markdown("Any format is accepted (mp3, ogg, flac, m4a, wav, …) – converted to WAV automatically.")
+st.markdown("only .wav format is accepted (server does not contain ffmpeg 😢")
 
 uploaded = st.file_uploader(
     "Choose an audio file",
-    type=["wav","mp3","ogg","flac","m4a","aac","wma","aiff","aif"],
+    type=["wav"],
     key="uploader"
 )
 
