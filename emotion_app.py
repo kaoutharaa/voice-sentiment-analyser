@@ -1,17 +1,15 @@
 """
 Speech Emotion Recognition - Streamlit App
-Supports: real-time streaming | hold-to-record | file upload
+Supports: file upload
 Models: Classical MLP + fine-tuned wav2vec 2.0
 Model weights loaded from HuggingFace Hub: Kaouthara/voice-emotion-detector
 """
 
-import os, io, json, warnings, time
+import os, io, json, warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
 import streamlit as st
-import soundfile as sf
-import sounddevice as sd
 import librosa
 import noisereduce as nr
 import joblib
@@ -38,26 +36,6 @@ st.markdown("""
 <style>
 body { font-family: 'Segoe UI', sans-serif; }
 
-.mic-btn {
-    width: 80px; height: 80px; border-radius: 50%;
-    background: linear-gradient(135deg, #25D366 0%, #128C7E 100%);
-    border: none; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 36px;
-    box-shadow: 0 4px 15px rgba(37,211,102,0.4);
-    transition: all 0.2s ease;
-    margin: 0 auto;
-}
-.mic-btn:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(37,211,102,0.6); }
-.mic-btn.recording {
-    background: linear-gradient(135deg, #FF4444 0%, #CC0000 100%);
-    box-shadow: 0 4px 15px rgba(255,68,68,0.5);
-    animation: pulse 1s infinite;
-}
-@keyframes pulse {
-    0%,100% { transform: scale(1); }
-    50%      { transform: scale(1.12); }
-}
 
 .emotion-card {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -286,16 +264,6 @@ def run_predictions(audio_bytes, models_loaded, models):
     return results
 
 
-# ──────────────────────────────────────────────
-# Real-time recorder helper (using sounddevice)
-# ──────────────────────────────────────────────
-def record_audio(duration: float, sr: int = SR_CLASSICAL) -> bytes:
-    frames = sd.rec(int(duration * sr), samplerate=sr, channels=1, dtype="float32")
-    sd.wait()
-    buf = io.BytesIO()
-    sf.write(buf, frames, sr, format="WAV")
-    return buf.getvalue()
-
 
 # ──────────────────────────────────────────────
 # Sidebar – HuggingFace repo config & model selection
@@ -359,112 +327,37 @@ st.markdown(
     "a **Classical MLP** and a **fine-tuned wav2vec 2.0**."
 )
 
-tab_record, tab_realtime, tab_upload = st.tabs([
-    "🎤 Hold-to-Record", "⚡ Real-time Stream", "📂 Upload Audio"
-])
-
 # ═══════════════════════════════════════════════
-# TAB 1 – Hold-to-Record
+# Upload Audio
 # ═══════════════════════════════════════════════
-with tab_record:
-    st.markdown("### 🎤 Record Your Voice")
-    st.markdown("Press the microphone button below, speak, then press **Analyse**.")
+st.markdown("### 📂 Upload an Audio File")
+st.markdown("Any format is accepted (mp3, ogg, flac, m4a, wav, …) – converted to WAV automatically.")
 
-    audio_value = st.audio_input("Tap to record (hold and release)", key="recorder")
+uploaded = st.file_uploader(
+    "Choose an audio file",
+    type=["wav","mp3","ogg","flac","m4a","aac","wma","aiff","aif"],
+    key="uploader"
+)
 
-    if audio_value is not None:
-        st.audio(audio_value, format="audio/wav")
-        if st.button("🔍 Analyse Recording", use_container_width=True, key="analyse_rec"):
-            audio_bytes = audio_value.read() if hasattr(audio_value, "read") else bytes(audio_value)
-            results = run_predictions(audio_bytes, models_loaded, models)
-            if results:
-                cols = st.columns(len(results))
-                for col, (name, (label, probs)) in zip(cols, results.items()):
-                    with col:
-                        render_emotion_card(label, probs, name)
-    else:
-        st.info("👆 Click the mic icon above to start recording.")
+if uploaded:
+    with st.spinner("Converting to WAV…"):
+        try:
+            wav_bytes = to_wav_bytes(uploaded)
+            st.success(f"✅ Converted **{uploaded.name}** → WAV ({len(wav_bytes)//1024} KB)")
+            st.audio(wav_bytes, format="audio/wav")
+        except Exception as e:
+            st.error(f"Conversion failed: {e}")
+            st.stop()
 
-# ═══════════════════════════════════════════════
-# TAB 2 – Real-time streaming
-# ═══════════════════════════════════════════════
-with tab_realtime:
-    st.markdown("### ⚡ Real-time Emotion Detection")
-    st.markdown("Audio is captured in rolling windows and analysed continuously.")
-
-    col_l, col_r = st.columns([1, 2])
-    with col_l:
-        chunk_sec = st.slider("Window (seconds)", 1.0, 5.0, 2.0, 0.5)
-        overlap   = st.slider("Overlap (%)",       0,   80,  50,   5)
-
-    rt_placeholder = st.empty()
-    start_rt = col_l.button("▶ Start Real-time", use_container_width=True, key="rt_start")
-    stop_rt  = col_l.button("⏹ Stop",           use_container_width=True, key="rt_stop")
-
-    if "rt_running" not in st.session_state:
-        st.session_state["rt_running"] = False
-
-    if start_rt:
-        st.session_state["rt_running"] = True
-    if stop_rt:
-        st.session_state["rt_running"] = False
-
-    if st.session_state["rt_running"]:
-        step = chunk_sec * (1 - overlap / 100)
-        st.info(f"🔴 Recording… window={chunk_sec}s, step={step:.1f}s. Press **Stop** to end.")
-        iter_count = 0
-        while st.session_state["rt_running"] and iter_count < 60:
-            try:
-                audio_bytes = record_audio(chunk_sec, sr=SR_CLASSICAL)
-            except Exception as e:
-                rt_placeholder.error(f"Microphone error: {e}")
-                break
-
-            results = run_predictions(audio_bytes, models_loaded, models)
-            with rt_placeholder.container():
-                cols = st.columns(len(results))
-                for col, (name, (label, probs)) in zip(cols, results.items()):
-                    with col:
-                        render_emotion_card(label, probs, name)
-
-            time.sleep(max(0, step - chunk_sec))
-            iter_count += 1
-    else:
-        if not start_rt:
-            st.info("Press **▶ Start Real-time** to begin continuous detection.")
-
-# ═══════════════════════════════════════════════
-# TAB 3 – Upload Audio
-# ═══════════════════════════════════════════════
-with tab_upload:
-    st.markdown("### 📂 Upload an Audio File")
-    st.markdown("Any format is accepted (mp3, ogg, flac, m4a, wav, …) – converted to WAV automatically.")
-
-    uploaded = st.file_uploader(
-        "Choose an audio file",
-        type=["wav","mp3","ogg","flac","m4a","aac","wma","aiff","aif"],
-        key="uploader"
-    )
-
-    if uploaded:
-        with st.spinner("Converting to WAV…"):
-            try:
-                wav_bytes = to_wav_bytes(uploaded)
-                st.success(f"✅ Converted **{uploaded.name}** → WAV ({len(wav_bytes)//1024} KB)")
-                st.audio(wav_bytes, format="audio/wav")
-            except Exception as e:
-                st.error(f"Conversion failed: {e}")
-                st.stop()
-
-        if st.button("🔍 Analyse Audio", use_container_width=True, key="analyse_up"):
-            results = run_predictions(wav_bytes, models_loaded, models)
-            if results:
-                cols = st.columns(len(results))
-                for col, (name, (label, probs)) in zip(cols, results.items()):
-                    with col:
-                        render_emotion_card(label, probs, name)
-    else:
-        st.info("👆 Upload a file above to analyse its emotional content.")
+    if st.button("🔍 Analyse Audio", use_container_width=True, key="analyse_up"):
+        results = run_predictions(wav_bytes, models_loaded, models)
+        if results:
+            cols = st.columns(len(results))
+            for col, (name, (label, probs)) in zip(cols, results.items()):
+                with col:
+                    render_emotion_card(label, probs, name)
+else:
+    st.info("👆 Upload a file above to analyse its emotional content.")
 
 # ──────────────────────────────────────────────
 # Footer
